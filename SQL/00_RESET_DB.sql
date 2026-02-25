@@ -67,6 +67,19 @@ CREATE TABLE practice_feedback (
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE refresh_token (
+    refresh_token_id SERIAL PRIMARY KEY,
+    candidate_id INT NOT NULL REFERENCES candidate(candidate_id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ NULL,
+    replaced_by INT NULL REFERENCES refresh_token(refresh_token_id)
+);
+
 CREATE INDEX idx_candidate_email ON candidate(email);
 CREATE INDEX idx_practice_session_candidate ON practice_session(candidate_id);
 CREATE INDEX idx_cv_candidate ON cv_document(candidate_id);
+
+CREATE INDEX idx_refresh_token_candidate_id ON refresh_token(candidate_id);
+CREATE INDEX idx_refresh_token_expires_at ON refresh_token(expires_at);

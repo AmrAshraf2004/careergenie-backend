@@ -2,11 +2,96 @@ const express = require("express");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const pool = require("../db");
+const rateLimit = require("express-rate-limit");
+const crypto = require("crypto");
+const { issueCsrf } = require("../middleware/csrf");
+
+const { validateBody } = require("../middleware/validate");
+const { validateRegister, validateLogin } = require("../validators/auth.validators");
+const { requireAuth } = require("../middleware/auth");
 
 const router = express.Router();
 
+const loginLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 10,
+    message: { error: "Too many login attempts, try again later" }
+});
+
+function hashToken(token) {
+    return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+function signAccessToken(candidateId) {
+    if (!process.env.JWT_SECRET) {
+        const err = new Error("JWT_SECRET is not set");
+        err.statusCode = 500;
+        throw err;
+    }
+
+    const ttl = process.env.ACCESS_TOKEN_TTL || "15m";
+
+    return jwt.sign(
+        { candidate_id: candidateId },
+        process.env.JWT_SECRET,
+        { expiresIn: ttl }
+    );
+}
+
+function signRefreshToken(candidateId) {
+    if (!process.env.JWT_REFRESH_SECRET) {
+        const err = new Error("JWT_REFRESH_SECRET is not set");
+        err.statusCode = 500;
+        throw err;
+    }
+
+    const days = Number(process.env.REFRESH_TOKEN_TTL_DAYS || 7);
+    const seconds = days * 24 * 60 * 60;
+
+    return jwt.sign(
+        { candidate_id: candidateId, typ: "refresh" },
+        process.env.JWT_REFRESH_SECRET,
+        { expiresIn: seconds }
+    );
+}
+
+function refreshCookieOptions() {
+    const isProd = process.env.NODE_ENV === "production";
+
+    return {
+        httpOnly: true,
+        sameSite: "lax",
+        secure: isProd,
+        path: "/auth/refresh"
+    };
+}
+
+async function saveRefreshToken(candidateId, refreshToken) {
+    const days = Number(process.env.REFRESH_TOKEN_TTL_DAYS || 7);
+    const tokenHash = hashToken(refreshToken);
+
+    const result = await pool.query(
+        `INSERT INTO refresh_token (candidate_id, token_hash, expires_at)
+         VALUES ($1, $2, NOW() + ($3 || ' days')::interval)
+         RETURNING refresh_token_id`,
+        [candidateId, tokenHash, String(days)]
+    );
+
+    return result.rows[0].refresh_token_id;
+}
+
+async function revokeRefreshTokenRow(refreshTokenId, replacedById) {
+    await pool.query(
+        `UPDATE refresh_token
+         SET revoked_at = NOW(),
+             replaced_by = $2
+         WHERE refresh_token_id = $1`,
+        [refreshTokenId, replacedById || null]
+    );
+}
+
 // REGISTER
-router.post("/register", async (req, res) => {
+router.post("/register", validateBody(validateRegister), async (req, res, next) => {
     try {
         const {
             email,
@@ -18,10 +103,6 @@ router.post("/register", async (req, res) => {
             current_job_title,
             desired_role
         } = req.body;
-
-        if (!email || !password || !full_name) {
-            return res.status(400).json({ error: "Missing required fields" });
-        }
 
         const normalizedEmail = email.toLowerCase().trim();
 
@@ -54,21 +135,15 @@ router.post("/register", async (req, res) => {
         );
 
         res.status(201).json({ candidate: result.rows[0] });
-
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        next(err);
     }
 });
 
-// LOGIN
-router.post("/login", async (req, res) => {
+// LOGIN (access token + refresh cookie + refresh rotation storage)
+router.post("/login", loginLimiter, validateBody(validateLogin), async (req, res, next) => {
     try {
         const { email, password } = req.body;
-
-        if (!email || !password) {
-            return res.status(400).json({ error: "Missing credentials" });
-        }
-
         const normalizedEmail = email.toLowerCase().trim();
 
         const result = await pool.query(
@@ -93,24 +168,121 @@ router.post("/login", async (req, res) => {
             [candidate.candidate_id]
         );
 
-        const token = jwt.sign(
-            { candidate_id: candidate.candidate_id },
-            process.env.JWT_SECRET,
-            { expiresIn: "7d" }
-        );
+        const accessToken = signAccessToken(candidate.candidate_id);
+        const refreshToken = signRefreshToken(candidate.candidate_id);
+
+        await saveRefreshToken(candidate.candidate_id, refreshToken);
+
+        res.cookie("refresh_token", refreshToken, refreshCookieOptions());
 
         res.json({
-            token,
+            accessToken,
             candidate: {
                 candidate_id: candidate.candidate_id,
                 email: candidate.email,
                 full_name: candidate.full_name
             }
         });
-
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        next(err);
     }
 });
+
+// REFRESH (rotate refresh token, return new access token)
+router.post("/refresh", async (req, res, next) => {
+    try {
+        const refreshToken = req.cookies.refresh_token;
+
+        if (!refreshToken) {
+            return res.status(401).json({ error: "Missing refresh token" });
+        }
+
+        let payload;
+        try {
+            payload = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+        } catch (e) {
+            return res.status(401).json({ error: "Invalid refresh token" });
+        }
+
+        if (!payload || payload.typ !== "refresh" || !payload.candidate_id) {
+            return res.status(401).json({ error: "Invalid refresh token" });
+        }
+
+        const tokenHash = hashToken(refreshToken);
+
+        const dbRow = await pool.query(
+            `SELECT refresh_token_id, candidate_id, expires_at, revoked_at
+             FROM refresh_token
+             WHERE token_hash = $1`,
+            [tokenHash]
+        );
+
+        if (dbRow.rows.length === 0) {
+            return res.status(401).json({ error: "Refresh token not recognized" });
+        }
+
+        const row = dbRow.rows[0];
+
+        if (row.revoked_at) {
+            return res.status(401).json({ error: "Refresh token revoked" });
+        }
+
+        const now = new Date();
+        const expiresAt = new Date(row.expires_at);
+        if (expiresAt <= now) {
+            return res.status(401).json({ error: "Refresh token expired" });
+        }
+
+        const newAccessToken = signAccessToken(row.candidate_id);
+        const newRefreshToken = signRefreshToken(row.candidate_id);
+
+        const newRefreshId = await saveRefreshToken(row.candidate_id, newRefreshToken);
+
+        await revokeRefreshTokenRow(row.refresh_token_id, newRefreshId);
+
+        res.cookie("refresh_token", newRefreshToken, refreshCookieOptions());
+
+        res.json({ accessToken: newAccessToken });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// LOGOUT (revoke current refresh token + clear cookie)
+router.post("/logout", async (req, res, next) => {
+    try {
+        const refreshToken = req.cookies.refresh_token;
+
+        if (refreshToken) {
+            const tokenHash = hashToken(refreshToken);
+
+            const dbRow = await pool.query(
+                `SELECT refresh_token_id
+                 FROM refresh_token
+                 WHERE token_hash = $1`,
+                [tokenHash]
+            );
+
+            if (dbRow.rows.length > 0) {
+                await revokeRefreshTokenRow(dbRow.rows[0].refresh_token_id, null);
+            }
+        }
+
+        res.clearCookie("refresh_token", refreshCookieOptions());
+        res.json({ message: "Logged out" });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// OPTIONAL: "me" endpoint (uses access token header via requireAuth)
+router.get("/me", requireAuth, async (req, res) => {
+    res.json({ candidate_id: req.user.candidate_id });
+});
+
+
+// CSRF token (call this first from frontend)
+router.get("/csrf", issueCsrf);
+
 
 module.exports = router;

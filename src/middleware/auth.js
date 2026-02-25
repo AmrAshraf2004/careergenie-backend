@@ -10,7 +10,12 @@ function requireAuth(req, res, next) {
         }
 
         const payload = jwt.verify(token, process.env.JWT_SECRET);
-        req.user = payload; // { candidate_id }
+
+        if (!payload || !payload.candidate_id) {
+            return res.status(401).json({ error: "Invalid token" });
+        }
+
+        req.user = { candidate_id: payload.candidate_id };
         next();
     } catch (err) {
         return res.status(401).json({ error: "Invalid token" });
